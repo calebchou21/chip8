@@ -25,7 +25,25 @@ static const uint8_t FONTSET[80] = {
     0xF0, 0x80, 0xF0, 0x80, 0x80  // F
 };
 
-int sdl_init(SDLContext *context) {
+void audio_callback(void *userdata, uint8_t *stream, int len) {
+    Chip8 *chip8 = (Chip8 *)userdata;
+    int16_t *buffer = (int16_t *)stream;
+    int samples = len / sizeof(int16_t);
+
+    if (!chip8->sound_playing) {
+        memset(stream, 0, len);
+        return;
+    }
+
+    int period = SAMPLE_RATE / BEEP_FREQ;
+
+    for (int i = 0; i < samples; i++) {
+        buffer[i] = (audio_phase < period / 2) ? 8000 : -8000;
+        audio_phase = (audio_phase + 1) % period;
+    }
+}
+
+int sdl_init(SDLContext *context, Chip8 *chip8) {
     if (SDL_Init(SDL_INIT_EVERYTHING) < 0) {
         fprintf(stderr, "Error initializing SDL %s\n", SDL_GetError());
         return -1;
@@ -54,15 +72,28 @@ int sdl_init(SDLContext *context) {
         return -1;
     }
 
+    const uint8_t *key_states = SDL_GetKeyboardState(NULL);
+    context->key_states = key_states;
+
+    SDL_AudioSpec spec = {0};
+    spec.freq = SAMPLE_RATE;
+    spec.format = AUDIO_S16SYS;
+    spec.channels = 1;
+    spec.samples = 512;
+    spec.callback = audio_callback;
+    spec.userdata = chip8;
+
+    SDL_OpenAudio(&spec, NULL);
+    SDL_PauseAudio(0);
+
     return 1;
 }
 
 void draw_display(SDL_Renderer *renderer, const Chip8 *chip8) {
     SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
     SDL_RenderClear(renderer);
-
     SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
-
+    
     for (int y = 0; y < SCREEN_HEIGHT; y++) {
         for (int x = 0; x < SCREEN_WIDTH; x++) {
             if (chip8->display[y * SCREEN_WIDTH + x]) {
@@ -85,6 +116,19 @@ void sdl_cleanup(SDLContext *context) {
     SDL_Quit();
 }
 
+void handle_input(Chip8 *chip8, const uint8_t *key_states) {
+    static const SDL_Scancode scancodes[16] = {
+        SDL_SCANCODE_X, SDL_SCANCODE_1, SDL_SCANCODE_2, SDL_SCANCODE_3,
+        SDL_SCANCODE_Q, SDL_SCANCODE_W, SDL_SCANCODE_E, SDL_SCANCODE_A,
+        SDL_SCANCODE_S, SDL_SCANCODE_D, SDL_SCANCODE_Z, SDL_SCANCODE_C,
+        SDL_SCANCODE_4, SDL_SCANCODE_R, SDL_SCANCODE_F, SDL_SCANCODE_V
+    }; 
+
+    for (int i = 0; i < 16; i++) {
+        chip8->keypad[i] = key_states[scancodes[i]];
+    }
+}
+
 void chip8_init(Chip8 *chip8) {
     memset(chip8, 0, sizeof(Chip8));
     chip8->PC = 0x200;
@@ -94,8 +138,24 @@ void chip8_init(Chip8 *chip8) {
     }
 }
 
+void chip8_update_timers(Chip8 *chip8) {
+    if (chip8->delay_timer > 0) {
+        chip8->delay_timer--;
+    }
+
+    if (chip8->sound_timer > 0) {
+        chip8->sound_timer--;
+
+        if (!chip8->sound_playing) {
+            chip8->sound_playing = 1;
+        }
+    } else {
+        chip8->sound_playing = 0;
+    }
+}
+
 void chip8_debug(Chip8 *chip8, uint16_t instruction) {
-    printf("PC: %X | Instr: %X | SP: %d | I: %X | V: [",
+    printf("PC: %X | Instr: %04X | SP: %d | I: %X | V: [",
             chip8->PC, instruction, chip8->SP, chip8->I);
     for (int i = 0; i < 16; i++) {
         printf("%X", chip8->V[i]);
@@ -114,7 +174,7 @@ int load_rom(const char *path, Chip8 *chip8) {
     }
 
     uint8_t buffer[MAX_PROGRAM_SIZE];
-    int len = fread(buffer, sizeof buffer[0], MAX_PROGRAM_SIZE, fptr);
+    int len = fread(buffer, sizeof (uint8_t), MAX_PROGRAM_SIZE, fptr);
     
     for (int i = 0; i < len; i++) {
         chip8->memory[PROGRAM_START + i] = buffer[i];
@@ -129,8 +189,6 @@ void chip8_cycle(Chip8 *chip8) {
     
     if (chip8->debug) {
         chip8_debug(chip8, current_instruction);
-        printf("Press enter to continue...");
-        getchar();
     }
 
     chip8->PC += 2;
@@ -145,12 +203,10 @@ void chip8_cycle(Chip8 *chip8) {
     switch(F) {
         case 0x0:
             switch(NNN) {
-                // Clear display
-                case 0x0e0:
+                case 0x0e0: // Clear display
                     memset(chip8->display, 0, sizeof(chip8->display));
                     break;
-                // Return from subroutine
-                case 0x0ee:
+                case 0x0ee: // Return from subroutine
                     if (chip8->SP == 0) {
                         return;
                     }
@@ -159,149 +215,206 @@ void chip8_cycle(Chip8 *chip8) {
                     break;
             }
             break;
-        // Jump
-        case 0x1:
+        case 0x1: // Jump
            chip8->PC = NNN;
            break;
-        // Call subroutine at location NNN
-        case 0x2:
+        case 0x2: // Call subroutine at NNN
             chip8->stack[chip8->SP] = chip8->PC;
             chip8->SP++;
             chip8->PC = NNN;
             break;
-        // 0x3XNN: Skips one instruction if the value in VX is equal to NN
-        case 0x3:
+        case 0x3: // Skip if VX == NN
             if (chip8->V[X] == NN) {
                 chip8->PC += 2;
             }
             break;
-        // 0x4XNN Skips one instruction if the value in VX is not equal to NN
-        case 0x4:
+        case 0x4: // Skip if VX != NN
             if (chip8->V[X] != NN) {
                 chip8->PC += 2;
             }
             break;
-        // 0x5XY0 Skips one instruction if the values in VX and VY are equal
-        case 0x5:
+        case 0x5: // Skip if VX == VY
             if (chip8->V[X] == chip8->V[Y]) {
                 chip8->PC += 2;
             }
             break;
-        // 0x9XY0 Skips one instruction if the values in VX and VY are not equal
-        case 0x9:
+        case 0x9: // Skip if VX != VY
             if (chip8->V[X] != chip8->V[Y]) {
                 chip8->PC += 2;
             }
             break;
-        // 0x6XNN Sets register VX to value NN
-        case 0x6:
+        case 0x6: // Set VX to NN
             chip8->V[X] = NN;
             break;
-        // 0x7XNN Adds the value NN to VX
-        case 0x7:
+        case 0x7: // Add NN to VX
             chip8->V[X] += NN;
             break;
-        // Logical and arithmetic instructions
         case 0x8:
             switch(N) {
-                // 0x8XY0 sets VX to the value of VY
-                case 0x0:
+                case 0x0: // Set VX to VY
                     chip8->V[X] = chip8->V[Y];
                     break;
-                // 0x8XY1 sets VX to the bitwise OR of VX and VY
-                case 0x1:
+                case 0x1: // Set VX to VX | VY
                     chip8->V[X] = chip8->V[X] | chip8->V[Y];
                     break;
-                // 0x8XY2 sets VX to the bitwise AND of VX and VY
-                case 0x2:
+                case 0x2: // Set VX to VX & VY
                     chip8->V[X] = chip8->V[X] & chip8->V[Y];
                     break;
-                // 0x8XY3 sets VX to the bitwise XOR of VX and VY
-                case 0x3:
+                case 0x3: // Set VX to VX ^ VY
                     chip8->V[X] = chip8->V[X] ^ chip8->V[Y];
                     break;
-                // 0x8XY4 sets VX to the value of VX + VY
-                case 0x4: {
+                case 0x4: { // Set VX to VX + VY
                     uint16_t sum = chip8->V[X] + chip8->V[Y];
                     chip8->V[X] = sum & 0xff;
                     chip8->V[0xf] = (sum > 0xff);
                     break;
                 }
-                // 0x8XY5 sets VX to VX - VY
-                case 0x5:
-                    chip8->V[0xf] = (chip8->V[X] > chip8->V[Y]);
-                    chip8->V[X] -= chip8->V[Y];
+                case 0x5: { // Set VX to VX - VY
+                    int diff = chip8->V[X] - chip8->V[Y];
+                    chip8->V[X] = diff;
+                    if (diff >= 0) {
+                        chip8->V[0xf] = 1;
+                    } else {
+                        chip8->V[0xf] = 0;
+                    }
                     break;
-                // 0x8XY7 sets VX to VY - VX
-                case 0x7:
-                    chip8->V[0xf] = (chip8->V[X] > chip8->V[Y]);
-                    chip8->V[X] -= chip8->V[Y];
+                }
+                case 0x7: { // Set VX to VY - VX
+                    int diff = chip8->V[Y] - chip8->V[X];
+                    chip8->V[X] = diff;
+                    if (diff >= 0) {
+                        chip8->V[0xf] = 1;
+                    } else {
+                        chip8->V[0xf] = 0;
+                    }
                     break;
-                // 0x8XY6 shifts value in VX 1 bit to the right
-                // TODO: ambigous instruction but I will ignore Y for now (fix later)
-                case 0x6:
-                    chip8->V[0xf] = chip8->V[X] & 0x01;
+                }
+                case 0x6: { // Shift VX 1 bit right
+                    uint8_t bit = chip8->V[X] & 0x01;
                     chip8->V[X] >>= 1;
+                    chip8->V[0xf] = bit;
                     break;
-                // 08XYE shifts value in VX 1 bit to the left 
-                // TODO: Same not as previous shift instruction
-                case 0xe: 
-                    chip8->V[0xf] = chip8->V[X] & 0x01;
+                }
+                case 0xe: { // Shift VX 1 bit left
+                    uint8_t bit = (chip8->V[X] & 0x80) >> 7;               
                     chip8->V[X] <<= 1;
+                    chip8->V[0xf] = bit;
                     break;
+                }
             }
             break;
-        // 0xANNN sets index register I to NNN
-        case 0xa:
+        case 0xa: // Set I to NNN
             chip8->I = NNN;
             break;
-        // 0xBNNN jumps to address the address NNN plus the value in V0
-        // TODO: Ambigious instruction -- going with original implementation but should make configurable
-        case 0xb:
+        case 0xb: // Jump to NNN + V[0]
             chip8->PC = NNN + chip8->V[0];
             break;
-        // 0xCXNN generates a random number and binarys ANDs it with NN, putting the result in VX
-        case 0xC: {
+        case 0xC: { // Random number
             int8_t rand_num = rand();
             chip8->V[X] = NN & rand_num;
             break;
         }
-        // Draws an N pixel tall sprite held at location I to the screen at position (X, Y) held in VX and VY
-        case 0xD: {
-            X = chip8->V[X] % SCREEN_WIDTH;
-            Y = chip8->V[Y] % SCREEN_HEIGHT;
+        case 0xD: { // Display
+            uint8_t start_x = chip8->V[X] % SCREEN_WIDTH;
+            uint8_t start_y = chip8->V[Y] % SCREEN_HEIGHT;
             chip8->V[0xf] = 0;
 
-            for (int i = 0; i < N; i++) {
-                if (Y > SCREEN_HEIGHT) break;
+            for (int row = 0; row < N; row++) {
+                if (start_y + row >= SCREEN_HEIGHT) break;
 
-                uint8_t sprite_data = chip8->memory[chip8->I + i];
-                uint8_t mask = 0x80;
-                for (int j = 0; j < 8; j++) {
-                    uint8_t pixel = sprite_data & mask;
-                    if (X > SCREEN_WIDTH) break;
-                    if (pixel && chip8->display[SCREEN_WIDTH * Y + X]) {
-                        chip8->display[Y * X] = 0;
-                        chip8->V[0xf] = 1;
+                uint8_t sprite_data = chip8->memory[chip8->I + row];
+                for (int bit = 0; bit < 8; bit++) {
+                    if (start_x + bit >= SCREEN_WIDTH) break;
+
+                    uint8_t pixel = (sprite_data & (0x80 >> bit)) != 0;
+                    uint16_t index = (start_y + row) * SCREEN_WIDTH + (start_x + bit);
+                    if (pixel) {
+                        if (chip8->display[index]) {
+                            chip8->V[0xf] = 1;
+                        }
+                        chip8->display[index] ^= 1;
                     }
-                    else if (pixel && !chip8->display[SCREEN_WIDTH * Y + X]) {
-                        chip8->display[SCREEN_WIDTH * Y + X] = 0;
-                    }
-                    X++;
-                    mask >>= 1;
                 }
-                Y++;
             }
             break;
         }
-        default: {
+        case 0xE: 
+            switch (NN) {
+                case 0x9E: // Skip if key VX pressed
+                    if (chip8->keypad[chip8->V[X]]) {
+                        chip8->PC += 2;
+                    }
+                    break;
+                case 0xA1: // Skip if key VX not pressed
+                    if (!chip8->keypad[chip8->V[X]]) {
+                        chip8->PC += 2;
+                    }
+                    break;
+            }
+            break;
+        case 0xF: 
+            switch (NN) {
+                case 0x07: // Set VX to delay timer
+                    chip8->V[X] = chip8->delay_timer;
+                    break;
+                case 0x15: // Set delay timer to VX
+                    chip8->delay_timer = chip8->V[X];
+                    break;
+                case 0x18: // Set sound timer to VX
+                    chip8->sound_timer = chip8->V[X];
+                    break;
+                case 0x1E: { // Add VX to I
+                    uint16_t result = chip8->I + chip8->V[X];
+                    chip8->V[0xf] = (result > 0x0fff);
+                    chip8->I = result;
+                    break;
+                }
+                case 0x0A: { // Block until keypress
+                    int key_pressed = -1;
+                    
+                    for (int i = 0; i < 16; i++) {
+                        if (chip8->keypad[i]) {
+                            key_pressed = i;
+                            break;
+                        }
+                    }
+
+                    if (key_pressed == -1) {
+                        chip8->PC -= 2;
+                    } else {
+                        chip8->V[X] = key_pressed;
+                    }
+                    break;
+                }
+                case 0x29: { // Font character
+                    uint8_t digit = chip8->V[X] & 0x0f;
+                    chip8->I = 0x050 + digit * 5;
+                    break;
+                }
+                case 0x33: // BCD
+                    chip8->memory[chip8->I] = chip8->V[X] / 100;
+                    chip8->memory[chip8->I + 1] = (chip8->V[X] % 100) / 10;
+                    chip8->memory[chip8->I + 2] = chip8->V[X] % 10;
+                    break;
+                case 0x55: // Store memory
+                    for (int i = 0; i <= X; i++) {
+                        chip8->memory[chip8->I + i] = chip8->V[i];
+                    }
+                    break;
+                case 0x65: // Load memory
+                    for (int i = 0; i <= X; i++) {
+                        chip8->V[i] = chip8->memory[chip8->I + i]; 
+                    }
+                    break;
+            }
+            break;
+        default: 
             fprintf(stderr, "Invalid instruction: %X\n", current_instruction);
-        }
     }
 }
 
 int main(int argc, char *argv[]) {
-    int debug;
+    int debug = 0;
     if (argc > 3) {
         fprintf(stderr, "Usage: %s <rom_file> [-d]\n", argv[0]);
         return -1;
@@ -323,13 +436,16 @@ int main(int argc, char *argv[]) {
     }
 
     SDLContext context;
-    success = sdl_init(&context);
+    success = sdl_init(&context, &chip8);
     if(!success) {
         return -1;
     }
 
     SDL_Event e;
     int running = 1;
+
+    const uint32_t TIMER_INTERVAL = 1000 / 60;
+    unsigned int last_timer_tick = SDL_GetTicks();
 
     while(running) {
         while (SDL_PollEvent(&e)) {
@@ -338,10 +454,21 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        chip8_cycle(&chip8);
-        draw_display(context.renderer, &chip8);
+        SDL_PumpEvents();
+        
+        handle_input(&chip8, context.key_states);
 
-        SDL_Delay(1); // Eventually implement timer instead.
+        for (int i = 0; i < CYCLES_PER_FRAME; i++) {
+            chip8_cycle(&chip8);
+        }
+        
+        uint32_t now = SDL_GetTicks();
+        if (now - last_timer_tick >= TIMER_INTERVAL) {
+            chip8_update_timers(&chip8);
+            last_timer_tick += TIMER_INTERVAL;
+        }
+        
+        draw_display(context.renderer, &chip8);
     }
 
     sdl_cleanup(&context);
