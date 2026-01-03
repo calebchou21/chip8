@@ -6,6 +6,8 @@
 #include <string.h>
 #include <time.h>
 
+static int audio_phase = 0;
+
 static const uint8_t FONTSET[80] = {
     0xF0, 0x90, 0x90, 0x90, 0xF0, // 0
     0x20, 0x60, 0x20, 0x20, 0x70, // 1

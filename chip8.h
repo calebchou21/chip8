@@ -36,9 +36,7 @@ typedef struct {
     const uint8_t *key_states;
 } SDLContext;
 
-static int audio_phase = 0;
 void audio_callback(void *userdata, uint8_t *stream, int len);
-
 int sdl_init(SDLContext *context, Chip8 *chip8);
 void sdl_cleanup(SDLContext *context);
 void handle_input(Chip8 *chip8, const uint8_t *key_states);
